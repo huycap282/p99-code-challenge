@@ -26,7 +26,7 @@ export function validateDto<T extends object>(
       return
     }
 
-    req[source] = instance as never
+    Object.defineProperty(req, source, { value: instance, writable: true, configurable: true })
     next()
   }
 }

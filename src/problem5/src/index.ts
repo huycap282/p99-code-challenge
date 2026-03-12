@@ -1,5 +1,6 @@
 import express from 'express'
 import 'reflect-metadata'
+import pinoHttp from 'pino-http'
 import { ResourceController } from './controllers/resource.controller'
 import { AppDataSource } from './database/dataSource'
 import { ResourceRepository } from './repositories/resource.repository'
@@ -7,15 +8,17 @@ import { createResourceRouter } from './routes/resource.routes'
 import { ResourceService } from './services/resource.service'
 import { errorHandler } from './middlewares/errorHandler'
 import { swaggerSpec } from './swagger'
+import { logger } from './utils/logger'
 
 const PORT = process.env.PORT ?? 3000
 
 async function bootstrap() {
   await AppDataSource.initialize()
-  console.log('Database connected')
+  logger.info('Database connected')
 
   const app = express()
   app.use(express.json())
+  app.use(pinoHttp({ logger }))
   app.get('/docs/swagger.json', (_req, res) => res.json(swaggerSpec))
   app.get('/docs', (_req, res) => {
     res.send(`<!DOCTYPE html>
@@ -40,12 +43,12 @@ async function bootstrap() {
   const resourceService = new ResourceService(resourceRepository)
   const resourceController = new ResourceController(resourceService)
 
-  app.use('/api/resources', createResourceRouter(resourceController))
+  app.use('/api/v1/resources', createResourceRouter(resourceController))
 
   app.use(errorHandler)
 
   app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`)
+    logger.info(`Server running on port ${PORT}`)
   })
 }
 

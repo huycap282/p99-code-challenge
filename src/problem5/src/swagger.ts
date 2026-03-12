@@ -60,7 +60,7 @@ const options: swaggerJsdoc.Options = {
       },
     },
     paths: {
-      '/api/resources': {
+      '/api/v1/resources': {
         post: {
           summary: 'Create a resource',
           tags: ['Resources'],
@@ -150,7 +150,7 @@ const options: swaggerJsdoc.Options = {
           },
         },
       },
-      '/api/resources/{id}': {
+      '/api/v1/resources/{id}': {
         get: {
           summary: 'Get a resource by ID',
           tags: ['Resources'],

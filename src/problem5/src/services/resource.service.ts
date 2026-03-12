@@ -10,6 +10,7 @@ import {
   PaginatedResult,
   ResourceRepository,
 } from '../repositories/resource.repository'
+import { logger } from '../utils/logger'
 
 export type { CreateResourceDto, FindManyQuery, UpdateResourceDto }
 
@@ -23,15 +24,20 @@ export class ResourceService {
   constructor(private readonly resourceRepository: ResourceRepository) {}
 
   async create(dto: CreateResourceDto): Promise<Resource> {
-    return this.resourceRepository.create({
+    const resource = await this.resourceRepository.create({
       name: dto.name,
       status: dto.status ?? ResourceStatus.ACTIVE,
     })
+    logger.info({ id: resource.id, name: resource.name }, 'Resource created')
+    return resource
   }
 
   async findById(id: string): Promise<Resource> {
     const resource = await this.resourceRepository.findById(id)
-    if (!resource) throw new ResourceNotFoundError(id)
+    if (!resource) {
+      logger.warn({ id }, 'Resource not found')
+      throw new ResourceNotFoundError(id)
+    }
     return resource
   }
 
@@ -43,18 +49,19 @@ export class ResourceService {
       },
       status: query.status,
     }
-
     return this.resourceRepository.findMany(options)
   }
 
   async update(id: string, dto: UpdateResourceDto): Promise<Resource> {
     await this.findById(id)
     const updated = await this.resourceRepository.update(id, dto)
+    logger.info({ id }, 'Resource updated')
     return updated!
   }
 
   async delete(id: string): Promise<void> {
     await this.findById(id)
     await this.resourceRepository.delete(id)
+    logger.info({ id }, 'Resource deleted')
   }
 }
