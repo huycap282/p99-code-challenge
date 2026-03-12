@@ -11,7 +11,7 @@ Responsibilities:
   - User can access to see leaderboard
 
 ## High Level Architecture
-```code
+```
                 +-------------+
                 |   Client    |
                 +-------------+
@@ -30,240 +30,282 @@ Responsibilities:
                +---------------+
                | Score Worker  |
                +---------------+
-                |            |
-                |            |
-                ▼            ▼
-           PostgreSQL      Redis
-        (source of truth)  (leaderboard)
-                |
-                ▼
-        Leaderboard Cache
-                |
-                ▼
-        WebSocket Broadcast
-                |
-                ▼
-              Clients
+                |       |      \
+                |       |       \
+                ▼       ▼        ▼
+           PostgreSQL  Redis   WebSocket Gateway
+        (source of truth) (leaderboard)    |
+                                           ▼
+                                         Clients
 ```
 
 ## API list
-- Update score
-```code
+
+### Update score
+```
 POST /api/v1/score/update
 ```
-Request
-```code
-{
-  "action_id": "string",
-  "metadata": {}
-}
-```
 Headers
-```code
+```
 Authorization: Bearer <JWT>
 ```
-Response
-```code
+Request
+```json
 {
-  "success": true,
-  "new_score": "1200"
+  "action_id": "string"
 }
 ```
-- Get leaderboard
-```code
+Response `202 Accepted` — the request is acknowledged; the actual score update is processed asynchronously via the worker. The client receives the updated leaderboard through the WebSocket `leaderboard_update` event.
+```json
+{
+  "success": true
+}
+```
+
+Error responses
+
+| Status | Scenario |
+|--------|----------|
+| 401 | Missing or invalid JWT |
+| 409 | `action_id` already processed (duplicate/replay) |
+| 422 | `action_id` references an unknown or disabled action type |
+| 500 | Internal server error |
+
+### Get leaderboard
+```
 GET /api/v1/leaderboard
 ```
-Request
-```code
+Auth: None (public endpoint)
 
-```
 Response
-```code
+```json
 {
   "data": [
     {
         "id": 1,
         "username": "logan",
         "rank": 1,
-        "score": "1200"
+        "score": 1200
     },
     {
         "id": 2,
         "username": "alex",
         "rank": 2,
-        "score": "1000"
+        "score": 1000
     }
   ]
 }
 ```
 
 ## Flow
+
 ### Step 1: User completes an action
 
-Client sends request: POST /api/v1/score/update
+Client sends: `POST /api/v1/score/update` with the `action_id` that identifies which action was completed.
 
 ### Step 2: API Service
 
-API server responsibilities:
-1.	Authenticate user (JWT Bearer token)
-2.	Validate action request 
-3.	Prevent duplicate actions
-4.	Publish event to Kafka
+1. Authenticate user via JWT Bearer token
+2. Look up `action_id` type in `action_types` table — reject (422) if unknown or disabled
+3. Check `score_actions` for duplicate `action_id` — reject (409) if already processed
+4. Publish event `{ user_id, action_id }` to Kafka
+5. Return `202 Accepted`
+
+The score delta is **not** supplied by the client. It is resolved server-side by the worker from the `action_types` table.
 
 ### Step 3: Kafka Event Consumer
 
-Kafka acts as a buffer and event bus. 
+Kafka acts as a buffer and event bus.
 
 Benefits:
  - Decouples API from score processing
  - Prevents API overload
  - Enables horizontal scaling
 
-Partition by key:
-```code
+Partition key:
+```
 user_id
 ```
+Partitioning by `user_id` guarantees per-user event ordering, preventing race conditions on a single user's score.
 
 ### Step 4: Score Worker
 
-Responsibilities:
-1. Anti-cheat validation
-2. Persist action log
-3. Update score
-4. Update leaderboard
-5. Publish socket event
-
-```code
-Kafka Event
+```
+Kafka Event { user_id, action_id }
      │
      ▼
-Anti-cheat validation
+Look up score_delta from action_types table
      │
      ▼
-Insert action log
+Insert into score_actions (ON CONFLICT action_id DO NOTHING)
+  → if 0 rows inserted: discard (already processed)
      │
      ▼
-Update user score
+UPDATE users SET score = score + score_delta WHERE id = user_id
      │
      ▼
-Update Redis leaderboard
+ZINCRBY leaderboard:global <score_delta> <user_id>
+DEL leaderboard:top10  ← invalidate cache
      │
      ▼
-Publish Socket Event
+Publish WebSocket event: leaderboard_update
 ```
 
 ## Database schema
 
-Users 
-```code
+### Users
+```
 users
 ------
-id
-username
-password
-score
-created_at
+id           BIGSERIAL  PK
+username     VARCHAR    UNIQUE NOT NULL
+password     VARCHAR    NOT NULL
+score        INT        NOT NULL DEFAULT 0
+created_at   TIMESTAMPTZ
 ```
 
-Score Action
-```code
+### Action Types
+```
+action_types
+-------------
+action_type  VARCHAR  PK
+score_delta  INT      NOT NULL
+enabled      BOOLEAN  NOT NULL DEFAULT true
+```
+Server-controlled table that defines how much each action is worth. Workers resolve `score_delta` from here — clients never supply it.
+
+### Score Actions
+```
 score_actions
 --------------
-id
-user_id
-action_id
-score_delta
-created_at
+id           BIGSERIAL    PK
+user_id      BIGINT       NOT NULL  REFERENCES users(id)
+action_id    VARCHAR      NOT NULL
+action_type  VARCHAR      NOT NULL  REFERENCES action_types(action_type)
+score_delta  INT          NOT NULL
+created_at   TIMESTAMPTZ
 --------------
 Constraint: UNIQUE(action_id)
 ```
-UNIQUE(action_id) to prevent replay attacks.
+`UNIQUE(action_id)` prevents replay attacks and duplicate processing. The worker uses `INSERT ... ON CONFLICT DO NOTHING` and checks affected rows to detect duplicates idempotently.
 
 ## Redis Leaderboard
-Leaderboard stored using Redis Sorted Set
+
+Leaderboard stored as a Redis Sorted Set.
 
 Key
-```code
+```
 leaderboard:global
 ```
 
-Increase score
-```code
-ZINCRBY leaderboard:global 50 user_123
+Increase score (in worker, after DB update)
+```
+ZINCRBY leaderboard:global <score_delta> <user_id>
 ```
 
-Fetch top 10
-```code
-ZREVRANGE leaderboard:global 0 9 WITHSCORES
+Fetch top 10 (Redis 6.2+)
+```
+ZRANGE leaderboard:global 0 9 REV WITHSCORES
 ```
 
 ## Redis Cache Strategy
-To reduce Redis load.
+
+Cache the computed top 10 to reduce sorted set reads on `GET /api/v1/leaderboard`.
 
 Cache key:
-```code
+```
 leaderboard:top10
 ```
 
 Cache TTL:
-```code
+```
 5 seconds
 ```
 
-Update Flow:
-```code
-Worker updates Redis Sorted Set
-        │
-        ▼
-Recompute top10
-        │
-        ▼
-Update Redis Cache
+**Update strategy — cache invalidation (not recompute):**
+
+After the worker updates the sorted set, it deletes `leaderboard:top10`. The next `GET /api/v1/leaderboard` request recomputes from the sorted set and repopulates the cache. This avoids race conditions that arise when multiple workers each try to recompute and overwrite the cache simultaneously.
+
+```
+Worker: ZINCRBY leaderboard:global ...
+Worker: DEL leaderboard:top10
+         │
+         ▼ (next read)
+API: GET leaderboard:top10 → cache miss
+API: ZRANGE leaderboard:global 0 9 REV WITHSCORES
+API: SET leaderboard:top10 <result> EX 5
 ```
 
 ## Real-time Leaderboard Updates
-Use WebSocket Gateway
 
-Event triggered when leaderboard changes.
+WebSocket Gateway broadcasts leaderboard changes to all connected clients.
+
+### Initial state on connect
+
+When a client establishes a WebSocket connection, the gateway immediately pushes the current top 10 so the client does not need to wait for the next score change:
+
+```json
+{
+  "event": "leaderboard_initial",
+  "data": [
+    {"user_id": "1", "score": 1200, "rank": 1},
+    {"user_id": "2", "score": 1180, "rank": 2}
+  ]
+}
+```
+
+### Live update event
+
+Broadcast to all connected clients after each worker cycle:
 
 Event:
-```code
+```
 leaderboard_update
 ```
 Payload:
 ```json
 {
+  "event": "leaderboard_update",
   "data": [
-    {"user_id": "1", "score": 1200},
-    {"user_id": "2", "score": 1180}
+    {"user_id": "1", "score": 1200, "rank": 1},
+    {"user_id": "2", "score": 1180, "rank": 2}
   ]
 }
 ```
 
 ## Anti-Cheat Layer
-Critical for preventing malicious score inflation.
 
-### Idempotency Protection
-Ensure each action is processed once.
-```code
-UNIQUE(action_id)
+### Action type validation (server-side delta)
+
+The `score_delta` for any action is defined in the `action_types` table, controlled by the server. Clients submit only an `action_id` string — they never supply or influence the score increment. An unknown or disabled `action_type` is rejected at the API layer before the event reaches Kafka.
+
+### Replay and duplicate protection
+
+`UNIQUE(action_id)` on `score_actions` ensures each action is processed at most once. The worker uses:
+
+```sql
+INSERT INTO score_actions (user_id, action_id, action_type, score_delta)
+VALUES (...)
+ON CONFLICT (action_id) DO NOTHING;
 ```
 
-### Action Validation
-Server must verify: Action id is valid
+If 0 rows are inserted, the event is discarded. This makes the worker safe under Kafka's at-least-once delivery.
 
-### Replay Attack Protection
-Ensure each action is processed once.
-```code
-UNIQUE(action_id)
-```
+### Action token integrity (optional hardening)
+
+For higher-assurance environments, the server can issue a short-lived signed token when a user begins an action. The token encodes `{ user_id, action_type, expires_at }` and is verified on submission. This prevents fabricated `action_id` values entirely.
 
 ## Failure Handling
+
 ### Worker crash
-
-Kafka guarantees at-least-once delivery.
-
-Idempotency prevents duplicates.
+Kafka re-delivers unacknowledged messages. Idempotency via `ON CONFLICT DO NOTHING` prevents double-processing.
 
 ### Redis failure
-Leaderboard rebuilt from database.
+`leaderboard:top10` cache is rebuilt on next read from `leaderboard:global`. If the sorted set is also lost, it can be rebuilt by replaying `score_actions` from PostgreSQL:
+
+```sql
+SELECT user_id, SUM(score_delta) FROM score_actions GROUP BY user_id;
+```
+
+### Postgres write failure
+The worker does not acknowledge the Kafka message. Kafka re-delivers after the consumer timeout, and the worker retries.
