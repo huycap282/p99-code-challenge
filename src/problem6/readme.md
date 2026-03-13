@@ -30,13 +30,18 @@ Responsibilities:
                +---------------+
                | Score Worker  |
                +---------------+
-                |       |      \
-                |       |       \
-                ▼       ▼        ▼
-           PostgreSQL  Redis   WebSocket Gateway
-        (source of truth) (leaderboard)    |
-                                           ▼
-                                         Clients
+                       |
+                       ▼
+                  PostgreSQL          ← commit first (source of truth)
+                       |
+                       ▼
+                     Redis            ← only after Postgres commit
+                       |
+                       ▼
+               WebSocket Gateway      ← only after Postgres commit
+                       |
+                       ▼
+                     Clients
 ```
 
 ## API list
@@ -137,19 +142,21 @@ Kafka Event { user_id, action_id }
 Look up score_delta from action_types table
      │
      ▼
-Insert into score_actions (ON CONFLICT action_id DO NOTHING)
-  → if 0 rows inserted: discard (already processed)
+BEGIN TRANSACTION
+  Insert into score_actions (ON CONFLICT action_id DO NOTHING)
+    → if 0 rows inserted: ROLLBACK, discard event (duplicate)
+  UPDATE users SET score = score + score_delta WHERE id = user_id
+COMMIT  ← source of truth is now updated
      │
-     ▼
-UPDATE users SET score = score + score_delta WHERE id = user_id
-     │
+     │  Postgres commit failed → do NOT ack Kafka → retry
      ▼
 ZINCRBY leaderboard:global <score_delta> <user_id>
-DEL leaderboard:top10  ← invalidate cache
+DEL leaderboard:top10
      │
      ▼
 Publish WebSocket event: leaderboard_update
 ```
+Redis and WebSocket are only reached after a successful Postgres commit. If either fails at this stage it is non-fatal — Redis can be rebuilt from Postgres, and WebSocket clients will receive the next broadcast or can call `GET /api/v1/leaderboard`.
 
 ## Database schema
 
@@ -308,4 +315,10 @@ SELECT user_id, SUM(score_delta) FROM score_actions GROUP BY user_id;
 ```
 
 ### Postgres write failure
-The worker does not acknowledge the Kafka message. Kafka re-delivers after the consumer timeout, and the worker retries.
+The worker does not acknowledge the Kafka message. Kafka re-delivers after the consumer timeout and the worker retries. Redis and WebSocket are never touched, so no inconsistency is introduced.
+
+### Redis write failure (after Postgres commit)
+Postgres is already committed — the score is safe. The sorted set will be stale until the next successful write or a manual rebuild. The WebSocket broadcast is skipped (or best-effort). Clients see a temporarily stale leaderboard but no data is lost.
+
+### WebSocket publish failure (after Postgres + Redis commit)
+Non-fatal. Affected clients miss one push event. They will receive the next broadcast or can refresh via `GET /api/v1/leaderboard`.
